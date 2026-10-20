@@ -119,6 +119,23 @@ jobs:
           # No `gh issue view` / `gh pr view` here: they could fetch the
           # unfiltered thread and bypass include_comments_by_actor.
           claude_args: |
+            --model claude-sonnet-5-5
+            --effort medium
             --max-turns 30
             --allowedTools "${{ inputs.allowed_tools }}"
             --append-system-prompt "You are bugseeai, this organization's helper bot. Follow the repository's CLAUDE.md. Add tests for every fix. Never write '@bugseeai' in your own comments."
+
+      # Drop the "Claude finished @user's task in Ns —— View job" header from
+      # the final reply. The action offers no switch for it.
+      - name: Strip status header from reply
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.BUGSEEAI_TOKEN }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          [ -n "$NUMBER" ] || exit 0
+          id=$(gh api --paginate "repos/${{ github.repository }}/issues/${NUMBER}/comments" \
+            --jq '[.[] | select(.user.login == "bugseeai" and (.body | startswith("**Claude finished")))] | last | .id // empty')
+          [ -n "$id" ] || exit 0
+          body=$(gh api "repos/${{ github.repository }}/issues/comments/${id}" --jq '.body | sub("^\\*\\*Claude finished[^\n]*\n+---\n+"; "")')
+          gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${id}" -f body="$body" >/dev/null
