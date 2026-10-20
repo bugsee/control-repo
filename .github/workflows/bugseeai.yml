@@ -1,0 +1,124 @@
+# Destination: your-org/.github  →  .github/workflows/bugseeai.yml
+#
+# Central, reusable workflow for the @bugseeai helper. Every repo calls this
+# file through a small caller workflow, so changes here apply org-wide.
+#
+# Org-level settings this relies on (Settings → Secrets and variables → Actions):
+#   secret   CLAUDE_CODE_OAUTH_TOKEN  Claude subscription token (already set)
+#   secret   BUGSEEAI_TOKEN           bugseeai's personal access token
+#                                     (repo access + read:org / org Members: read)
+#   variable BUGSEEAI_USER_ID         output of: gh api users/bugseeai --jq .id
+name: bugseeai (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      allowed_tools:
+        description: "Shell commands Claude may run in this repo (Claude Code --allowedTools syntax)"
+        type: string
+        required: false
+        default: "Bash(npm ci),Bash(npm test:*),Bash(npm run lint:*)"
+      trusted_authors_only:
+        description: "Only respond on issues/PRs opened by org members or collaborators"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  bugseeai:
+    # Fast pre-filter, before a runner starts:
+    #  - the message must mention @bugseeai (or the issue is assigned to bugseeai)
+    #  - bugseeai never triggers itself
+    #  - the person mentioning it must be an owner, org member, or collaborator
+    #  - optionally, the issue/PR itself must be opened by a trusted author
+    # The action then re-checks that the triggering user has write access.
+    if: |
+      (
+        github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '@bugseeai') &&
+        github.event.comment.user.login != 'bugseeai' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+        (!inputs.trusted_authors_only || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
+      ) || (
+        github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '@bugseeai') &&
+        github.event.comment.user.login != 'bugseeai' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+        (!inputs.trusted_authors_only || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
+      ) || (
+        github.event_name == 'pull_request_review' &&
+        contains(github.event.review.body, '@bugseeai') &&
+        github.event.review.user.login != 'bugseeai' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.review.author_association) &&
+        (!inputs.trusted_authors_only || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
+      ) || (
+        github.event_name == 'issues' && (
+          (
+            (contains(github.event.issue.body, '@bugseeai') || contains(github.event.issue.title, '@bugseeai')) &&
+            github.event.issue.user.login != 'bugseeai' &&
+            contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
+          ) ||
+          (github.event.action == 'assigned' && github.event.assignee.login == 'bugseeai')
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # One run at a time per issue/PR; extra mentions queue instead of piling up
+    # on the shared subscription.
+    concurrency:
+      group: bugseeai-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read # lets Claude read CI results on PRs
+    steps:
+      # Claude only sees comments/reviews from org members (+ bugseeai itself).
+      # Outside collaborators you trust can be appended to the list below.
+      - name: Build trusted commenter list
+        id: trusted
+        env:
+          GH_TOKEN: ${{ secrets.BUGSEEAI_TOKEN }}
+        run: |
+          set -euo pipefail
+          users=$(gh api --paginate "orgs/${{ github.repository_owner }}/members" --jq '.[].login' | paste -sd, -)
+          if [ -z "$users" ]; then
+            echo "::error::Could not list org members; check BUGSEEAI_TOKEN scopes (read:org)."
+            exit 1
+          fi
+          echo "list=${users},bugseeai" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.BUGSEEAI_TOKEN }}
+
+      - name: Run Claude Code as bugseeai
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Claude credential: org-wide subscription token only.
+          # Do NOT also set anthropic_api_key, or it takes precedence.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+
+          # Act as the bugseeai user (robobun-style)
+          github_token: ${{ secrets.BUGSEEAI_TOKEN }}
+          bot_name: "bugseeai"
+          bot_id: ${{ vars.BUGSEEAI_USER_ID }}
+
+          trigger_phrase: "@bugseeai"
+          assignee_trigger: "bugseeai"
+          branch_prefix: "bugseeai/"
+
+          # Hide comments/reviews from anyone outside the trusted list
+          include_comments_by_actor: ${{ steps.trusted.outputs.list }}
+
+          # Optional: verified commits. Add an SSH signing key to the bugseeai
+          # account and store the private key as an org secret.
+          # ssh_signing_key: ${{ secrets.BUGSEEAI_SSH_SIGNING_KEY }}
+
+          # No `gh issue view` / `gh pr view` here: they could fetch the
+          # unfiltered thread and bypass include_comments_by_actor.
+          claude_args: |
+            --max-turns 30
+            --allowedTools "${{ inputs.allowed_tools }}"
+            --append-system-prompt "You are bugseeai, this organization's helper bot. Follow the repository's CLAUDE.md. Add tests for every fix. Never write '@bugseeai' in your own comments."
