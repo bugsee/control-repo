@@ -118,14 +118,13 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 1
-          # Default read-only GITHUB_TOKEN; the PAT must not be left in .git/config.
+          # Default read-only GITHUB_TOKEN. Note: claude-code-action itself rewrites
+          # `origin` to embed the PAT, so this does not keep the PAT out of
+          # .git/config; the fork refusal and trusted-author gating do that job.
           persist-credentials: false
 
       - name: Run Claude Code as bugseeai
         uses: anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa # v1.0.256
-        env:
-          # Keep the tokens out of the environment of the commands Claude runs.
-          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1"
         with:
           # Claude credential: org-wide subscription token only.
           # Do NOT also set anthropic_api_key, or it takes precedence.
@@ -162,11 +161,12 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.BUGSEEAI_TOKEN }}
+          REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
         run: |
           [ -n "$NUMBER" ] || exit 0
-          id=$(gh api --paginate "repos/${{ github.repository }}/issues/${NUMBER}/comments" \
+          id=$(gh api --paginate "repos/${REPO}/issues/${NUMBER}/comments" \
             --jq '[.[] | select(.user.login == "bugseeai" and (.body | startswith("**Claude finished")))] | last | .id // empty')
           [ -n "$id" ] || exit 0
-          body=$(gh api "repos/${{ github.repository }}/issues/comments/${id}" --jq '.body | sub("^\\*\\*Claude finished[^\n]*\n+---\n+"; "")')
-          gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${id}" -f body="$body" >/dev/null
+          body=$(gh api "repos/${REPO}/issues/comments/${id}" --jq '.body | sub("^\\*\\*Claude finished[^\n]*\n+---\n+"; "")')
+          gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -f body="$body" >/dev/null

@@ -34,4 +34,6 @@ repository's own code, so it must never run on untrusted input:
 - It refuses pull requests whose head is in a fork.
 - With `trusted_authors_only`, the issue/PR must also be opened by a trusted author.
 - Claude only sees comments from org members.
+
+Because of `trusted_authors_only`, bot-authored PRs (e.g. Dependabot) are ignored.
 - Third-party actions are pinned to commit SHAs.
