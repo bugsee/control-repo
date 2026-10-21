@@ -22,7 +22,13 @@ on:
         description: "Only respond on issues/PRs opened by org members or collaborators"
         type: boolean
         required: false
-        default: false
+        default: true
+    # Declared explicitly so callers pass just these two (no `secrets: inherit`).
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      BUGSEEAI_TOKEN:
+        required: true
 
 jobs:
   bugseeai:
@@ -58,7 +64,10 @@ jobs:
             github.event.issue.user.login != 'bugseeai' &&
             contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)
           ) ||
-          (github.event.action == 'assigned' && github.event.assignee.login == 'bugseeai')
+          (
+            github.event.action == 'assigned' && github.event.assignee.login == 'bugseeai' &&
+            (!inputs.trusted_authors_only || contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
+          )
         )
       )
     runs-on: ubuntu-latest
@@ -72,6 +81,24 @@ jobs:
       contents: read
       actions: read # lets Claude read CI results on PRs
     steps:
+      # The PAT and the Claude token are available to this job, and Claude may
+      # run the repo's own code (npm ci / npm test). Code from a fork is
+      # untrusted, so never run on it, even when a member mentions @bugseeai.
+      # Fails closed: if the PR can't be looked up, the job stops.
+      - name: Refuse pull requests from forks
+        if: github.event.issue.pull_request || github.event.pull_request
+        env:
+          GH_TOKEN: ${{ secrets.BUGSEEAI_TOKEN }}
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          head=$(gh api "repos/${REPO}/pulls/${NUMBER}" --jq '.head.repo.full_name // "deleted-fork"')
+          if [ "${head,,}" != "${REPO,,}" ]; then
+            echo "::error::PR #${NUMBER} comes from '${head}', not from ${REPO}; bugseeai does not run on fork code."
+            exit 1
+          fi
+
       # Claude only sees comments/reviews from org members (+ bugseeai itself).
       # Outside collaborators you trust can be appended to the list below.
       - name: Build trusted commenter list
@@ -88,13 +115,16 @@ jobs:
           echo "list=${users},bugseeai" >> "$GITHUB_OUTPUT"
 
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 1
-          token: ${{ secrets.BUGSEEAI_TOKEN }}
+          # Default read-only GITHUB_TOKEN. Note: claude-code-action itself rewrites
+          # `origin` to embed the PAT, so this does not keep the PAT out of
+          # .git/config; the fork refusal and trusted-author gating do that job.
+          persist-credentials: false
 
       - name: Run Claude Code as bugseeai
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@a5a423f75c251dcbff8a74e99f83b2cb03c72bfa # v1.0.256
         with:
           # Claude credential: org-wide subscription token only.
           # Do NOT also set anthropic_api_key, or it takes precedence.
@@ -131,11 +161,12 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.BUGSEEAI_TOKEN }}
+          REPO: ${{ github.repository }}
           NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
         run: |
           [ -n "$NUMBER" ] || exit 0
-          id=$(gh api --paginate "repos/${{ github.repository }}/issues/${NUMBER}/comments" \
+          id=$(gh api --paginate "repos/${REPO}/issues/${NUMBER}/comments" \
             --jq '[.[] | select(.user.login == "bugseeai" and (.body | startswith("**Claude finished")))] | last | .id // empty')
           [ -n "$id" ] || exit 0
-          body=$(gh api "repos/${{ github.repository }}/issues/comments/${id}" --jq '.body | sub("^\\*\\*Claude finished[^\n]*\n+---\n+"; "")')
-          gh api -X PATCH "repos/${{ github.repository }}/issues/comments/${id}" -f body="$body" >/dev/null
+          body=$(gh api "repos/${REPO}/issues/comments/${id}" --jq '.body | sub("^\\*\\*Claude finished[^\n]*\n+---\n+"; "")')
+          gh api -X PATCH "repos/${REPO}/issues/comments/${id}" -f body="$body" >/dev/null
